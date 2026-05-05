@@ -20,6 +20,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 
@@ -204,3 +205,104 @@ def test_load_examples_from_configs_defaults(
         force_data=False,
     )
     mock_command.run.assert_called_once()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_uses_safe_yaml_loader(mock_command_cls):
+    """metadata.yaml must be parsed with yaml.safe_load.
+
+    Constructing arbitrary Python objects via YAML tags (e.g. !!python/object)
+    is unsafe and must be rejected. This test asserts that a payload that
+    would succeed under yaml.Loader is refused, guarding against regressions
+    that reintroduce yaml.load(..., Loader=yaml.Loader).
+    """
+    from superset.commands.exceptions import CommandInvalidError
+    from superset.commands.importers.v1.utils import METADATA_FILE_NAME
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        # Payload that constructs an arbitrary Python object. yaml.safe_load
+        # rejects this with a YAMLError; yaml.Loader would happily execute it.
+        (root / METADATA_FILE_NAME).write_text(
+            "!!python/object/apply:os.system ['echo pwned']\n"
+        )
+
+        with pytest.raises(CommandInvalidError) as exc_info:
+            load_configs_from_directory(root)
+
+        assert METADATA_FILE_NAME in str(exc_info.value)
+        # Importer must never be invoked when metadata parsing fails.
+        mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_non_mapping_metadata(mock_command_cls):
+    """metadata.yaml must be a mapping; scalars/lists are rejected."""
+    from superset.commands.exceptions import CommandInvalidError
+    from superset.commands.importers.v1.utils import METADATA_FILE_NAME
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / METADATA_FILE_NAME).write_text("- just\n- a\n- list\n")
+
+        with pytest.raises(CommandInvalidError):
+            load_configs_from_directory(root)
+
+        mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_malformed_metadata_yaml(
+    mock_command_cls,
+):
+    """Malformed YAML must surface as a CommandInvalidError, not a raw YAMLError."""
+    from superset.commands.exceptions import CommandInvalidError
+    from superset.commands.importers.v1.utils import METADATA_FILE_NAME
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / METADATA_FILE_NAME).write_text("key: value\n  bad indent: oops\n: :")
+
+        with pytest.raises(CommandInvalidError):
+            load_configs_from_directory(root)
+
+        mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_strips_type_from_valid_metadata(
+    mock_command_cls,
+):
+    """Valid metadata behaviour is preserved: 'type' is stripped before import."""
+    from superset.commands.importers.v1.utils import METADATA_FILE_NAME
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / METADATA_FILE_NAME).write_text(
+            "version: '1.0.0'\ntype: Database\nextra: keep-me\n"
+        )
+
+        load_configs_from_directory(root)
+
+        mock_command_cls.assert_called_once()
+        contents_arg = mock_command_cls.call_args[0][0]
+        rewritten = yaml.safe_load(contents_arg[METADATA_FILE_NAME])
+        assert "type" not in rewritten
+        assert rewritten == {"version": "1.0.0", "extra": "keep-me"}
+        mock_command.run.assert_called_once()
