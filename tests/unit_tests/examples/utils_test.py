@@ -20,6 +20,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 
@@ -204,3 +205,124 @@ def test_load_examples_from_configs_defaults(
         force_data=False,
     )
     mock_command.run.assert_called_once()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_uses_safe_yaml_loader(mock_command_cls):
+    """load_configs_from_directory must reject unsafe YAML tags in metadata.yaml.
+
+    Using yaml.load with the default Loader allows arbitrary Python object
+    construction (e.g. ``!!python/object/apply:os.system``). Switching to
+    yaml.safe_load means such payloads are rejected with yaml.YAMLError before
+    any object is constructed.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        # Unsafe YAML: would invoke os.system under the unsafe loader.
+        (root / "metadata.yaml").write_text(
+            "!!python/object/apply:os.system ['echo pwned']\n"
+        )
+
+        with pytest.raises(yaml.YAMLError):
+            load_configs_from_directory(root)
+
+    # The unsafe payload must be rejected before the import command runs.
+    mock_command_cls.assert_not_called()
+    mock_command.run.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_malformed_metadata(mock_command_cls):
+    """Malformed YAML in metadata.yaml must raise yaml.YAMLError."""
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        # Invalid YAML syntax (unbalanced brackets).
+        (root / "metadata.yaml").write_text("version: '1.0.0'\n  : :\n][\n")
+
+        with pytest.raises(yaml.YAMLError):
+            load_configs_from_directory(root)
+
+    mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_non_mapping_metadata(mock_command_cls):
+    """metadata.yaml that does not parse to a mapping must be rejected."""
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        # Valid YAML, but a list — not the mapping the importer expects.
+        (root / "metadata.yaml").write_text("- just\n- a\n- list\n")
+
+        with pytest.raises(ValueError, match="must contain a YAML mapping"):
+            load_configs_from_directory(root)
+
+    mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_strips_type_from_valid_metadata(
+    mock_command_cls,
+):
+    """Valid metadata.yaml must still be parsed and have ``type`` stripped.
+
+    This pins down the behavior preserved by the safe-loader switch: a valid
+    metadata mapping with a ``type`` key is passed through to
+    ImportExamplesCommand with that key removed.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text(
+            "version: '1.0.0'\n"
+            "type: Dashboard\n"
+            "timestamp: '2020-12-11T22:52:56.534241+00:00'\n"
+        )
+        # A second YAML so we exercise the full directory traversal.
+        (root / "other.yaml").write_text("hello: world\n")
+
+        load_configs_from_directory(root)
+
+    mock_command_cls.assert_called_once()
+    forwarded_contents = mock_command_cls.call_args.args[0]
+    rewritten_metadata = yaml.safe_load(forwarded_contents["metadata.yaml"])
+    assert "type" not in rewritten_metadata
+    assert rewritten_metadata["version"] == "1.0.0"
+    assert forwarded_contents["other.yaml"] == "hello: world\n"
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_handles_empty_metadata(mock_command_cls):
+    """An empty metadata.yaml must be tolerated and produce an empty mapping."""
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text("")
+
+        load_configs_from_directory(root)
+
+    mock_command_cls.assert_called_once()
+    forwarded_contents = mock_command_cls.call_args.args[0]
+    assert yaml.safe_load(forwarded_contents["metadata.yaml"]) == {}
