@@ -20,7 +20,10 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
+
+from superset.commands.importers.v1.utils import METADATA_FILE_NAME
 
 
 def _create_example_tree(base_dir: Path) -> Path:
@@ -204,3 +207,134 @@ def test_load_examples_from_configs_defaults(
         force_data=False,
     )
     mock_command.run.assert_called_once()
+
+
+def _write_metadata_dir(base_dir: Path, metadata_content: str) -> Path:
+    """Create a directory containing a single ``metadata.yaml`` file.
+
+    Used by ``load_configs_from_directory`` regression tests below.
+    """
+    metadata_dir = base_dir / "configs"
+    metadata_dir.mkdir()
+    (metadata_dir / METADATA_FILE_NAME).write_text(metadata_content)
+    return metadata_dir
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_strips_type_from_metadata(mock_command_cls):
+    """``load_configs_from_directory`` must strip the ``type`` key from metadata.yaml.
+
+    Removing ``type`` lets us import any exported model from the unzipped
+    directory directly. The dumped metadata should still be a YAML mapping.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = _write_metadata_dir(
+            Path(tmpdir),
+            "version: '1.0.0'\ntype: Database\ntimestamp: '2024-01-01T00:00:00'\n",
+        )
+
+        load_configs_from_directory(root)
+
+    contents = mock_command_cls.call_args.args[0]
+    assert METADATA_FILE_NAME in contents
+    parsed = yaml.safe_load(contents[METADATA_FILE_NAME])
+    assert isinstance(parsed, dict)
+    assert "type" not in parsed
+    assert parsed["version"] == "1.0.0"
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_unsafe_yaml_payload(mock_command_cls):
+    """Unsafe YAML tags (e.g. ``!!python/object/apply``) must not be deserialized.
+
+    Using ``yaml.safe_load`` ensures that arbitrary Python object construction
+    cannot be triggered by a crafted ``metadata.yaml``. The previous
+    implementation used ``yaml.Loader``, which would happily evaluate the tag
+    and execute ``os.system`` (or similar) on import.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    unsafe_payload = "!!python/object/apply:os.system ['echo pwned']\n"
+    with TemporaryDirectory() as tmpdir:
+        root = _write_metadata_dir(Path(tmpdir), unsafe_payload)
+
+        with pytest.raises(yaml.YAMLError):
+            load_configs_from_directory(root)
+
+    mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_malformed_yaml(mock_command_cls):
+    """Syntactically invalid metadata.yaml must surface as a ``YAMLError``.
+
+    This guards against silently swallowing parse errors and continuing with
+    an unexpected (or empty) metadata payload.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    malformed = "version: '1.0.0'\n  : : bad indent : :\n- [unbalanced\n"
+    with TemporaryDirectory() as tmpdir:
+        root = _write_metadata_dir(Path(tmpdir), malformed)
+
+        with pytest.raises(yaml.YAMLError):
+            load_configs_from_directory(root)
+
+    mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_handles_non_mapping_metadata(mock_command_cls):
+    """A non-mapping metadata.yaml (e.g. a list) must not crash the importer.
+
+    ``safe_load`` returns the parsed YAML as-is, which may not be a mapping.
+    The loader normalizes such payloads to an empty dict so that downstream
+    code (which relies on ``dict.pop``) keeps working.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = _write_metadata_dir(Path(tmpdir), "- one\n- two\n")
+
+        load_configs_from_directory(root)
+
+    contents = mock_command_cls.call_args.args[0]
+    assert yaml.safe_load(contents[METADATA_FILE_NAME]) == {}
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_preserves_metadata_without_type(mock_command_cls):
+    """Existing valid metadata without a ``type`` key must round-trip unchanged."""
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = _write_metadata_dir(
+            Path(tmpdir),
+            "version: '1.0.0'\ntimestamp: '2024-01-01T00:00:00'\n",
+        )
+
+        load_configs_from_directory(root)
+
+    contents = mock_command_cls.call_args.args[0]
+    parsed = yaml.safe_load(contents[METADATA_FILE_NAME])
+    assert parsed == {
+        "version": "1.0.0",
+        "timestamp": "2024-01-01T00:00:00",
+    }
