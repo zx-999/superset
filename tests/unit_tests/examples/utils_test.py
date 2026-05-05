@@ -20,6 +20,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 
@@ -204,3 +205,110 @@ def test_load_examples_from_configs_defaults(
         force_data=False,
     )
     mock_command.run.assert_called_once()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_uses_safe_yaml_loader(mock_command_cls):
+    """load_configs_from_directory() must reject unsafe YAML tags.
+
+    The metadata.yaml content is parsed before being handed to the importer.
+    Using ``yaml.safe_load`` ensures arbitrary Python object construction tags
+    such as ``!!python/object/apply`` raise ``yaml.constructor.ConstructorError``
+    instead of being silently executed.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        # Malicious payload that would execute arbitrary code under yaml.Loader.
+        (root / "metadata.yaml").write_text(
+            "!!python/object/apply:os.system ['echo pwned']\n"
+        )
+
+        with pytest.raises(yaml.constructor.ConstructorError):
+            load_configs_from_directory(root)
+
+    # The importer must never be invoked when the metadata is unsafe.
+    mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_malformed_metadata(mock_command_cls):
+    """Malformed YAML in metadata.yaml must surface as a YAMLError.
+
+    A truncated or syntactically invalid metadata.yaml should fail loudly so
+    operators can fix the import payload, rather than being silently coerced.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text("version: '1.0.0'\n: : :\n")
+
+        with pytest.raises(yaml.YAMLError):
+            load_configs_from_directory(root)
+
+    mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_strips_metadata_type(mock_command_cls):
+    """Valid metadata is preserved with the ``type`` key stripped before import.
+
+    This is the behavior the unsafe loader was previously providing and must be
+    preserved when switching to ``yaml.safe_load``.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text(
+            "version: '1.0.0'\n"
+            "type: Dashboard\n"
+            "timestamp: '2020-12-11T22:52:56.534241+00:00'\n"
+        )
+        (root / "dashboard.yaml").write_text(
+            "dashboard_title: Example\nuuid: dddddddd-dddd-dddd-dddd-dddddddddddd\n"
+        )
+
+        load_configs_from_directory(root)
+
+    mock_command_cls.assert_called_once()
+    contents = mock_command_cls.call_args[0][0]
+    assert "metadata.yaml" in contents
+    rewritten = yaml.safe_load(contents["metadata.yaml"])
+    assert "type" not in rewritten
+    assert rewritten["version"] == "1.0.0"
+    # Other YAML files in the directory are forwarded untouched.
+    assert "dashboard.yaml" in contents
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_handles_missing_metadata(mock_command_cls):
+    """A missing metadata.yaml must not blow up; behavior matches a ``{}`` default."""
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "dashboard.yaml").write_text(
+            "dashboard_title: Example\nuuid: dddddddd-dddd-dddd-dddd-dddddddddddd\n"
+        )
+
+        load_configs_from_directory(root)
+
+    mock_command_cls.assert_called_once()
+    contents = mock_command_cls.call_args[0][0]
+    # An empty metadata default round-trips to an empty mapping.
+    assert yaml.safe_load(contents["metadata.yaml"]) == {}
