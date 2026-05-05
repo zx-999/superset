@@ -20,6 +20,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 
@@ -202,5 +203,98 @@ def test_load_examples_from_configs_defaults(
         {},
         overwrite=True,
         force_data=False,
+    )
+    mock_command.run.assert_called_once()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_strips_type_from_metadata(mock_command_cls):
+    """load_configs_from_directory must parse metadata.yaml safely and drop the
+    'type' key so the unzipped directory can be imported as any model.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "version": "1.0.0",
+                    "type": "Dashboard",
+                    "timestamp": "2020-12-11T22:52:56.534241+00:00",
+                }
+            )
+        )
+        (root / "databases").mkdir()
+        (root / "databases" / "examples.yaml").write_text(
+            yaml.safe_dump({"database_name": "examples", "version": "1.0.0"})
+        )
+
+        load_configs_from_directory(root, overwrite=False, force_data=False)
+
+    args, kwargs = mock_command_cls.call_args
+    contents = args[0]
+    assert "metadata.yaml" in contents
+    parsed_metadata = yaml.safe_load(contents["metadata.yaml"])
+    assert "type" not in parsed_metadata
+    assert parsed_metadata["version"] == "1.0.0"
+    assert kwargs == {"overwrite": False, "force_data": False}
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_unsafe_yaml(mock_command_cls):
+    """Malicious YAML payloads using arbitrary Python tags must be rejected
+    rather than being deserialized into live Python objects.
+
+    yaml.safe_load() refuses Python-specific tags like !!python/object/apply,
+    which is the protection this test guards. Using yaml.load() with the
+    default Loader would execute the tag and construct an os.system call.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    malicious_payload = (
+        "!!python/object/apply:os.system\n"
+        "args: ['echo pwned > /tmp/superset_yaml_pwned']\n"
+    )
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text(malicious_payload)
+
+        with pytest.raises(yaml.YAMLError):
+            load_configs_from_directory(root, overwrite=True, force_data=False)
+
+    mock_command.run.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_handles_missing_metadata(mock_command_cls):
+    """When metadata.yaml is absent, load_configs_from_directory must default
+    to an empty dict and still invoke the importer.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    mock_command = MagicMock()
+    mock_command_cls.return_value = mock_command
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "databases").mkdir()
+        (root / "databases" / "examples.yaml").write_text(
+            yaml.safe_dump({"database_name": "examples", "version": "1.0.0"})
+        )
+
+        load_configs_from_directory(root)
+
+    args, _ = mock_command_cls.call_args
+    contents = args[0]
+    assert yaml.safe_load(contents["metadata.yaml"]) is None or isinstance(
+        yaml.safe_load(contents["metadata.yaml"]), dict
     )
     mock_command.run.assert_called_once()
