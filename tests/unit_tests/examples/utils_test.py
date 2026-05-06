@@ -20,6 +20,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
+import pytest
 import yaml
 
 
@@ -204,3 +205,81 @@ def test_load_examples_from_configs_defaults(
         force_data=False,
     )
     mock_command.run.assert_called_once()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_strips_type_from_metadata(mock_command_cls):
+    """metadata.yaml should be parsed and the 'type' key stripped before passing
+    contents to ImportExamplesCommand.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "version": "1.0.0",
+                    "type": "Database",
+                    "timestamp": "2020-12-11T22:52:56.534241+00:00",
+                }
+            )
+        )
+
+        mock_command = MagicMock()
+        mock_command_cls.return_value = mock_command
+
+        load_configs_from_directory(root)
+
+        mock_command_cls.assert_called_once()
+        contents = mock_command_cls.call_args.args[0]
+        loaded_metadata = yaml.safe_load(contents["metadata.yaml"])
+        assert "type" not in loaded_metadata
+        assert loaded_metadata["version"] == "1.0.0"
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_rejects_unsafe_yaml_tags(mock_command_cls):
+    """Untrusted YAML tags that would trigger arbitrary object construction
+    must be rejected by the hardened loader rather than silently executed.
+
+    yaml.safe_load() only resolves a fixed set of scalar/collection tags, so
+    payloads using tags like !!python/object/apply: must raise YAMLError.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        # A canonical PyYAML "unsafe" payload: building an arbitrary Python
+        # object via yaml.Loader. safe_load must refuse this.
+        (root / "metadata.yaml").write_text(
+            "!!python/object/apply:os.system ['echo pwned']\n"
+        )
+
+        mock_command = MagicMock()
+        mock_command_cls.return_value = mock_command
+
+        with pytest.raises(yaml.YAMLError):
+            load_configs_from_directory(root)
+
+        mock_command_cls.assert_not_called()
+
+
+@patch("superset.examples.utils.ImportExamplesCommand")
+def test_load_configs_from_directory_handles_malformed_metadata(mock_command_cls):
+    """Malformed YAML in metadata.yaml must surface as a YAMLError rather than
+    being silently swallowed or producing an unexpected object type.
+    """
+    from superset.examples.utils import load_configs_from_directory
+
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "metadata.yaml").write_text("version: '1.0.0'\n  : bad: indent\n")
+
+        mock_command = MagicMock()
+        mock_command_cls.return_value = mock_command
+
+        with pytest.raises(yaml.YAMLError):
+            load_configs_from_directory(root)
+
+        mock_command_cls.assert_not_called()
